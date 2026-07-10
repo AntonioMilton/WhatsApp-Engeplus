@@ -52,7 +52,7 @@ function esc(s){ return (s||"").replace(/[&<>]/g, c=>({"&":"&amp;","<":"&lt;",">
 
 async function refresh(){
   try{
-    const r = await fetch("api/conversations", { headers:{ "Accept":"application/json" } });
+    const r = await fetch("/admin/api/conversations", { headers:{ "Accept":"application/json" } });
     if(!r.ok) throw new Error(r.status);
     convs = await r.json();
     renderList();
