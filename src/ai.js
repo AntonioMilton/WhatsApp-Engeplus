@@ -1,14 +1,11 @@
-// Orquestrador de IA (Claude). Recebe o histórico da conversa e devolve:
-//  - resposta_cliente: texto natural para enviar no WhatsApp
-//  - categoria: categoria do chamado (chave de CATEGORY_TO_TYPE)
-//  - urgencia: baixa | media | alta
-//  - acao: enviar_link | criar_chamado | escalar_humano | fora_escopo | continuar
-// A saída é JSON estruturado para a lógica ler com segurança.
+// Orquestrador de IA. Suporta OpenAI (GPT) e Anthropic (Claude).
+// Escolha o provedor pela variável AI_PROVIDER = "openai" | "anthropic".
+// Retorna JSON estruturado: { resposta_cliente, categoria, urgencia, acao }.
 
 import Anthropic from "@anthropic-ai/sdk";
+import OpenAI from "openai";
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-5";
+const PROVIDER = (process.env.AI_PROVIDER || "anthropic").toLowerCase();
 
 const SYSTEM_PROMPT = `Você é o assistente virtual de atendimento da Central de Suporte de TI da Engeplus, atendendo pelo WhatsApp.
 
@@ -52,26 +49,44 @@ IMPORTANTE
 - Nunca invente números de chamado, prazos ou soluções técnicas arriscadas.`;
 
 export async function orchestrate(history) {
-  const messages = history.map((m) => ({ role: m.role, content: m.content }));
+  if (PROVIDER === "openai") return orchestrateOpenAI(history);
+  return orchestrateAnthropic(history);
+}
 
+async function orchestrateAnthropic(history) {
+  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const model = process.env.ANTHROPIC_MODEL || "claude-sonnet-5";
   const resp = await client.messages.create({
-    model: MODEL,
+    model,
     max_tokens: 500,
     system: SYSTEM_PROMPT,
-    messages,
+    messages: history.map((m) => ({ role: m.role, content: m.content })),
   });
-
   const text = resp.content
     .filter((b) => b.type === "text")
     .map((b) => b.text)
     .join("")
     .trim();
+  return parseJson(text);
+}
 
+async function orchestrateOpenAI(history) {
+  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+  const resp = await client.chat.completions.create({
+    model,
+    max_tokens: 500,
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      ...history.map((m) => ({ role: m.role, content: m.content })),
+    ],
+  });
+  const text = (resp.choices?.[0]?.message?.content || "").trim();
   return parseJson(text);
 }
 
 function parseJson(text) {
-  // Extrai o primeiro bloco {...} para tolerar eventuais textos ao redor.
   const match = text.match(/\{[\s\S]*\}/);
   try {
     const obj = JSON.parse(match ? match[0] : text);
@@ -84,7 +99,6 @@ function parseJson(text) {
       acao: obj.acao || "continuar",
     };
   } catch {
-    // Fallback seguro se o modelo não devolver JSON válido
     return {
       resposta_cliente:
         "Desculpe, não consegui entender bem. Pode me explicar com outras palavras o que está acontecendo?",
