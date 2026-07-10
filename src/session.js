@@ -30,6 +30,12 @@ export function markEscalated(phone) {
   s.updatedAt = Date.now();
 }
 
+export function clearEscalated(phone) {
+  const s = getSession(phone);
+  s.escalated = false;
+  s.updatedAt = Date.now();
+}
+
 // Limpeza periódica de sessões velhas
 setInterval(() => {
   const now = Date.now();

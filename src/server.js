@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import crypto from "node:crypto";
 import { sendText, parseIncoming } from "./whatsapp.js";
-import { getSession, pushMessage, markEscalated } from "./session.js";
+import { getSession, pushMessage, markEscalated, clearEscalated } from "./session.js";
 import { orchestrate } from "./ai.js";
 import { linkFor, PORTAL_HOME } from "./jira-links.js";
 import { logMessage, setEscalated, allConversations } from "./store.js";
@@ -128,6 +128,33 @@ function adminAuth(req, res, next) {
 
 app.get("/admin", adminAuth, (_req, res) => res.type("html").send(DASHBOARD_HTML));
 app.get("/admin/api/conversations", adminAuth, (_req, res) => res.json(allConversations()));
+
+// Responder manualmente uma conversa (assume o atendimento; bot para de responder este contato)
+app.post("/admin/api/reply", adminAuth, async (req, res) => {
+  const { phone, text } = req.body || {};
+  if (!phone || !text || !text.trim()) {
+    return res.status(400).json({ error: "Informe phone e text." });
+  }
+  try {
+    await sendText(phone, text.trim());
+    logMessage(phone, "out", text.trim());
+    markEscalated(phone); // bot para de responder automaticamente este contato
+    setEscalated(phone, true);
+    res.json({ ok: true });
+  } catch (e) {
+    // Ex.: fora da janela de 24h -> a Meta rejeita mensagem não-template
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// Devolver a conversa ao bot
+app.post("/admin/api/reactivate", adminAuth, (req, res) => {
+  const { phone } = req.body || {};
+  if (!phone) return res.status(400).json({ error: "Informe phone." });
+  clearEscalated(phone);
+  setEscalated(phone, false);
+  res.json({ ok: true });
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`[server] ouvindo na porta ${PORT}`));
