@@ -5,4 +5,7 @@ node_modules/
 .env.*
 !.env.example
 
+# Dados das conversas (contêm mensagens de clientes) — não versionar
+data/
+
 *.log

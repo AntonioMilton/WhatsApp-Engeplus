@@ -5,6 +5,8 @@ import { sendText, parseIncoming } from "./whatsapp.js";
 import { getSession, pushMessage, markEscalated } from "./session.js";
 import { orchestrate } from "./ai.js";
 import { linkFor, PORTAL_HOME } from "./jira-links.js";
+import { logMessage, setEscalated, allConversations } from "./store.js";
+import { DASHBOARD_HTML } from "./dashboard.js";
 
 const app = express();
 
@@ -60,14 +62,19 @@ app.post("/webhook", (req, res) => {
 });
 
 // ---- Lógica de atendimento ----
-async function handleMessage({ from, text, nonText }) {
+async function handleMessage({ from, text, nonText, name }) {
   const session = getSession(from);
 
-  // Já escalado para humano: não responde automaticamente.
+  // Registra a mensagem recebida no painel.
+  logMessage(from, "in", text, { name });
+
+  // Já escalado para humano: não responde automaticamente (mas continua registrando).
   if (session.escalated) return;
 
   if (nonText) {
-    await reply(from, "Recebi seu arquivo/áudio 🙂 Por enquanto consigo te ajudar melhor por texto — pode me descrever rapidinho o que você precisa?");
+    const msg = "Recebi seu arquivo/áudio 🙂 Por enquanto consigo te ajudar melhor por texto — pode me descrever rapidinho o que você precisa?";
+    logMessage(from, "out", msg);
+    await reply(from, msg);
     return;
   }
 
@@ -82,13 +89,14 @@ async function handleMessage({ from, text, nonText }) {
     outbound += `\n\n👉 *${label}*\n${url}\n\nÉ só preencher que o chamado abre na nossa fila de suporte. Qualquer dúvida, é só me chamar por aqui!`;
   } else if (result.acao === "escalar_humano") {
     markEscalated(from);
+    setEscalated(from);
     outbound += "\n\nJá estou passando você para um atendente da equipe de TI. Em breve alguém responde por aqui 🙂";
-    // TODO: notificar equipe (e-mail/Slack/Jira) que esta conversa precisa de humano.
   } else if (result.acao === "fora_escopo") {
     outbound += `\n\nSe precisar de algo de TI, estou por aqui. Você também pode ver todos os tipos de atendimento em: ${PORTAL_HOME}`;
   }
 
   pushMessage(from, "assistant", result.resposta_cliente);
+  logMessage(from, "out", outbound, { categoria: result.categoria });
   await reply(from, outbound);
 }
 
@@ -101,6 +109,25 @@ async function reply(to, body) {
 }
 
 app.get("/", (_req, res) => res.send("WhatsApp Suporte TI — OK"));
+
+// ---- Painel de monitoramento (protegido por Basic Auth) ----
+function adminAuth(req, res, next) {
+  const user = process.env.ADMIN_USER;
+  const pass = process.env.ADMIN_PASS;
+  if (!user || !pass) {
+    return res.status(503).send("Painel não configurado: defina ADMIN_USER e ADMIN_PASS no .env");
+  }
+  const header = req.get("authorization") || "";
+  const [scheme, encoded] = header.split(" ");
+  if (scheme === "Basic" && encoded) {
+    const [u, p] = Buffer.from(encoded, "base64").toString().split(":");
+    if (u === user && p === pass) return next();
+  }
+  res.set("WWW-Authenticate", 'Basic realm="Painel Suporte TI"').status(401).send("Autenticação necessária");
+}
+
+app.get("/admin", adminAuth, (_req, res) => res.type("html").send(DASHBOARD_HTML));
+app.get("/admin/api/conversations", adminAuth, (_req, res) => res.json(allConversations()));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`[server] ouvindo na porta ${PORT}`));
