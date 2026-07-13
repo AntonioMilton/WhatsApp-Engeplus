@@ -19,7 +19,7 @@ Dentro da pasta do projeto, no seu computador:
 ```bash
 git init
 git add .
-git commit -m "MVP webhook WhatsApp -> Jira (Estratégia A)"
+git commit -m "Service Desk N1 completo: triagem + criação + acompanhamento no Jira"
 # crie um repo vazio no GitHub/GitLab/Bitbucket (ou no seu Git interno) e:
 git remote add origin URL_DO_SEU_REPO.git
 git push -u origin main
@@ -60,10 +60,19 @@ WHATSAPP_TOKEN=...              # token da Meta
 WHATSAPP_PHONE_NUMBER_ID=1161833617020228
 WHATSAPP_VERIFY_TOKEN=engeplus-suporte-2026
 META_APP_SECRET=...             # Configurações do app -> Básico (ou vazio no 1º teste)
-ANTHROPIC_API_KEY=sk-ant-...
-ANTHROPIC_MODEL=claude-sonnet-5
+AI_PROVIDER=openai              # ou anthropic
+OPENAI_API_KEY=sk-proj-...      # (se AI_PROVIDER=openai)
+ANTHROPIC_API_KEY=sk-ant-...    # (se AI_PROVIDER=anthropic)
 PORT=3001
-JIRA_PORTAL_BASE=https://ti-petkov.atlassian.net/servicedesk/customer/portal/1
+ADMIN_USER=admin
+ADMIN_PASS=...                  # painel /admin
+# Jira — criação e acompanhamento automático de chamados
+JIRA_EMAIL=antoniomiltonaa19@gmail.com
+JIRA_API_TOKEN=...              # id.atlassian.com -> Security -> API tokens
+JIRA_BASE_URL=https://ti-petkov.atlassian.net
+JIRA_PROJECT_KEY=SUP
+JIRA_ASSIGNEE_ACCOUNT_ID=712020:128a5a09-e336-4fa4-8510-194b1a4c2dd3
+JIRA_POLL_SECONDS=60
 ```
 
 ## 5. Escolher porta livre
@@ -138,7 +147,7 @@ Mande mensagem do seu celular de teste para o número de teste da Meta. Acompanh
 ```bash
 pm2 logs whatsapp-suporte
 ```
-O bot responde, faz a triagem e envia o link do portal SUP.
+O bot responde, faz a triagem, abre o chamado no Jira (SUP-XXX) e acompanha o ticket até o encerramento.
 
 ---
 

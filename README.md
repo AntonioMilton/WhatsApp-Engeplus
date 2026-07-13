@@ -1,78 +1,95 @@
-# WhatsApp Suporte de TI → Jira (Estratégia A)
+# WhatsApp Suporte de TI → Jira (Service Desk N1 completo)
 
-Bot de atendimento no WhatsApp usando a **Meta Cloud API oficial**. Quando um cliente
-manda mensagem no número **+55 47 9693-0617**, um assistente de IA (Claude) responde de
-forma natural, faz a triagem e envia o **link do tipo de solicitação correto** no portal
-do Jira Service Management (projeto **SUP – Central de Suporte de TI**).
+Assistente de atendimento no WhatsApp usando a **Meta Cloud API oficial**. Quando alguém
+manda mensagem no número **+55 47 9693-0617**, um assistente de IA atua como um
+**analista de suporte de primeiro nível (N1)** e conduz o atendimento inteiro:
 
-> **Estratégia A**: o bot conversa e entrega o link do portal. O próprio cliente preenche
-> e o chamado entra na fila com os SLAs e automações nativas do Jira. (A criação
-> automática via API — Estratégia B — fica para uma fase futura.)
+1. **Recepção** — cumprimenta e identifica se é atendimento novo ou continuação de chamado.
+2. **Entendimento** — conversa naturalmente e coleta nome, telefone, categoria, o que foi
+   afetado, sintomas, mensagens de erro, passos, início, usuários afetados, impacto e urgência.
+3. **Validação** — apresenta um resumo ("Entendi. Seu problema é o seguinte...") e só segue
+   após a confirmação do usuário.
+4. **Abertura automática no Jira** — cria o ticket no projeto **SUP** via API (tipo, categoria,
+   request type do portal, prioridade e responsável corretos) e informa o número (ex.: SUP-123).
+5. **Acompanhamento** — um monitor consulta o Jira periodicamente e avisa o usuário em
+   linguagem simples a cada mudança relevante (triagem, em atendimento, aguardando, em
+   testes, resolvido, fechado, reaberto).
+6. **Informações adicionais** — se o técnico comentar pedindo algo, o assistente repassa a
+   pergunta no WhatsApp, coleta a resposta e registra como comentário no ticket.
+7. **Encerramento** — quando resolvido, apresenta a solução e pede confirmação: confirmou,
+   fecha o ticket; não confirmou, **reabre automaticamente** com o novo relato.
+8. **Nova conversa** — após o encerramento, a próxima mensagem inicia um novo atendimento.
 
-## Como funciona
+O usuário nunca precisa acessar o Jira — o assistente é a interface única.
 
-1. Cliente manda mensagem → Meta Cloud API chama o `POST /webhook`.
-2. O servidor responde `200 OK` na hora e processa em background.
-3. O histórico vai para o Claude (`src/ai.js`), que devolve JSON: resposta natural +
-   categoria + ação.
-4. Se a ação for `enviar_link`, o servidor anexa o link certo (`src/jira-links.js`).
-5. A resposta é enviada de volta pela Cloud API (`src/whatsapp.js`).
-
-Como o cliente **inicia** a conversa, as respostas dentro da **janela de 24h são
-gratuitas** — não há custo de mensagem.
-
-## Estrutura
+## Arquitetura
 
 ```
-src/
-  server.js       webhook (verificação + recebimento) e orquestração
-  whatsapp.js     envio de mensagens e parse do payload da Meta
-  ai.js           orquestrador Claude + system prompt de triagem
-  jira-links.js   mapa categoria -> link do portal SUP (portal id = 1)
-  session.js      estado da conversa em memória (trocar por Redis em produção)
+Cliente (WhatsApp) ⇄ Meta Cloud API ⇄ src/server.js (webhook + máquina de estados)
+                                          │
+                    src/ai.js (analista N1 — Claude/GPT, saída JSON)
+                    src/jira.js (REST v3: criar, comentar, transicionar)
+                    src/monitor.js (polling do ciclo de vida → notificações)
+                    src/store.js (data/store.json: conversas, tickets, alertas, fila)
+                    src/session.js (histórico em memória, reidratado do store)
+                    src/dashboard.js (painel /admin + alertas do operador)
 ```
 
-## Tipos de solicitação mapeados (portal SUP)
+### Fases do atendimento (controladas pelo servidor)
 
-| Categoria da IA        | Tipo no portal                  | Link |
-|------------------------|----------------------------------|------|
-| acesso_senha / email   | Solicitar Acesso ao Sistema      | .../create/3 |
-| acesso_privilegiado    | Solicitar Acesso Privilegiado    | .../create/2 |
-| hardware               | Reportar Falha em Hardware       | .../create/7 |
-| equipamento            | Solicitar Equipamento            | .../create/9 |
-| software               | Solicitar Software ou Licença    | .../create/4 |
-| rede_internet / incidente | Reportar Incidente            | .../create/6 |
-| onboarding             | Integração de Novo Colaborador   | .../create/8 |
-| outros                 | Solicitar Suporte de TI          | .../create/1 |
+| Fase | O que acontece | Ações da IA aceitas |
+|---|---|---|
+| `triagem` | entendimento do problema | continuar, validar, criar_chamado, escalar_humano, fora_escopo |
+| `validacao` | resumo apresentado, aguarda confirmação | continuar, validar, criar_chamado, escalar_humano, fora_escopo |
+| `acompanhamento` | ticket aberto, monitor ativo | continuar, atualizar_chamado, encerrar, escalar_humano |
+| `resolucao` | resolvido, aguarda confirmação do usuário | continuar, atualizar_chamado, encerrar, reabrir, escalar_humano |
 
-Base: `https://ti-petkov.atlassian.net/servicedesk/customer/portal/1`
+A IA propõe a ação; o servidor valida contra a fase (ações fora da fase viram `continuar`).
+
+### Mapeamento no Jira (projeto SUP — ti-petkov.atlassian.net)
+
+| Categoria da IA | Tipo de item | Request type (portal) |
+|---|---|---|
+| incidente / rede_internet | [System] Incident | Reportar Incidente |
+| hardware | [System] Incident | Reportar Falha em Hardware |
+| acesso_senha / email | [System] Service request | Solicitar Acesso ao Sistema |
+| acesso_privilegiado | [System] Service request | Solicitar Acesso Privilegiado |
+| software | [System] Service request | Solicitar Software ou Licença |
+| equipamento | [System] Service request | Solicitar Equipamento |
+| onboarding | [System] Service request | Integração de Novo Colaborador |
+| outros | [System] Service request | Solicitar Suporte de TI |
+
+Urgência → prioridade: crítica→Highest, alta→High, média→Medium, baixa→Low (+ campo
+Urgency do JSM). Responsável padrão: AntonioMilton (`JIRA_ASSIGNEE_ACCOUNT_ID`).
+Se algum campo do JSM for recusado na criação, o bot tenta payloads progressivamente
+mais simples — a abertura do chamado nunca fica bloqueada por campo opcional.
+
+## Janela de 24h da Meta
+
+Notificações proativas (mudança de status) fora da janela de 24h são rejeitadas pela Meta.
+Nesse caso o bot: (1) guarda a mensagem e entrega quando o usuário escrever de novo, e
+(2) gera um **alerta para o operador** no painel `/admin` (e no log) com o texto pronto
+para envio manual por outro meio.
 
 ## Setup
 
 1. `npm install`
 2. Copie `.env.example` para `.env` e preencha:
    - `WHATSAPP_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_VERIFY_TOKEN`, `META_APP_SECRET`
-     (do painel *Meta for Developers* → app → WhatsApp).
-   - `ANTHROPIC_API_KEY` (e opcional `ANTHROPIC_MODEL`).
-3. `npm start` (sobe na porta 3000).
-4. Exponha o servidor por HTTPS público. Em desenvolvimento, use `ngrok http 3000`.
-5. No painel da Meta, configure o webhook:
-   - **Callback URL**: `https://SEU_DOMINIO/webhook`
-   - **Verify token**: o mesmo valor de `WHATSAPP_VERIFY_TOKEN`
-   - Inscreva-se no campo **messages**.
+   - `ANTHROPIC_API_KEY` (ou `OPENAI_API_KEY` com `AI_PROVIDER=openai`)
+   - `JIRA_EMAIL` + `JIRA_API_TOKEN` (token em id.atlassian.com → Security → API tokens)
+3. `npm start`
+4. Exponha o servidor por HTTPS público (dev: `ngrok http 3002`) e configure o webhook na Meta
+   (Callback `https://SEU_DOMINIO/webhook`, verify token igual ao `.env`, campo **messages**).
 
-## Testar sem a Meta
+## Testes
 
-Verificação do webhook:
-```
-curl "http://localhost:3000/webhook?hub.mode=subscribe&hub.verify_token=SEU_TOKEN&hub.challenge=123"
-# deve retornar: 123
-```
+`npm test` roda a suíte ponta a ponta com Meta/Jira/IA simulados (35 verificações):
+fluxo completo de abertura, acompanhamento, pergunta do técnico, resolução, encerramento,
+reabertura, janela de 24h, escalada para humano, fallbacks de criação e falha do Jira.
 
-## Próximos passos (fases seguintes)
+## Painel do operador
 
-- **Fila assíncrona** (BullMQ/Redis) para picos de mensagens.
-- **Notificar a equipe** quando `acao = escalar_humano` (e-mail/Slack/comentário no Jira).
-- **Mídia**: baixar imagens/áudios da Meta e anexar ao chamado.
-- **Estratégia B**: criar o chamado direto via API do Jira e devolver o nº (SUP-XXX).
-- **Template de utilidade** aprovado para reabrir conversa após 24h, se necessário.
+`/admin` (Basic Auth: `ADMIN_USER`/`ADMIN_PASS`): conversas em tempo real, resposta manual
+(pausa o bot para aquele contato), reativação do bot e **alertas do operador** no topo
+(notificações que precisam de envio manual, falhas de integração, pedidos de humano).

@@ -1,12 +1,13 @@
 {
   "name": "whatsapp-suporte-ti",
-  "version": "1.0.0",
-  "description": "Bot de atendimento WhatsApp (Meta Cloud API) que triga com IA e guia o cliente ao chamado certo no Jira (portal SUP).",
+  "version": "2.0.0",
+  "description": "Assistente de Service Desk N1 no WhatsApp (Meta Cloud API): triagem com IA, abertura automática de chamados no Jira (SUP), acompanhamento do ciclo de vida e encerramento.",
   "type": "module",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "dev": "node --watch src/server.js",
+    "test": "node test/e2e.mjs && node test/edge.mjs"
   },
   "engines": {
     "node": ">=20"

@@ -39,6 +39,11 @@ export const DASHBOARD_HTML = `<!doctype html>
   .composer button { padding:10px 16px; border:0; border-radius:8px; background:#2563eb; color:#fff; font-weight:600; cursor:pointer; }
   .composer button:disabled { opacity:.6; cursor:default; }
   .btn-sec { background:#475569 !important; font-size:12px; padding:6px 10px !important; }
+  #alerts { border-bottom:1px solid #334155; background:#1c1917; max-height:180px; overflow-y:auto; }
+  .alert-item { padding:8px 20px; border-bottom:1px solid #292524; font-size:12px; }
+  .alert-item .a-head { color:#fbbf24; font-weight:600; }
+  .alert-item .a-msg { color:#e7e5e4; margin-top:2px; white-space:pre-wrap; }
+  .alert-item .a-reason { color:#a8a29e; margin-top:2px; }
 </style>
 </head>
 <body>
@@ -46,6 +51,7 @@ export const DASHBOARD_HTML = `<!doctype html>
   <h1>Painel de Atendimento — Suporte TI</h1>
   <span class="meta" id="meta">carregando…</span>
 </header>
+<div id="alerts"></div>
 <div class="wrap">
   <div class="list" id="list"></div>
   <div class="col">
@@ -69,7 +75,24 @@ async function refresh(){
     renderThread(convs.find(c=>c.phone===selected));
     const humanos = convs.filter(c=>c.escalated).length;
     document.getElementById("meta").textContent = convs.length + " conversas · " + humanos + " em atendimento humano";
+    await refreshAlerts();
   }catch(e){ document.getElementById("meta").textContent = "erro ao carregar ("+e.message+")"; }
+}
+
+async function refreshAlerts(){
+  try{
+    const r = await fetch("/admin/api/alerts", { headers:{ "Accept":"application/json" } });
+    if(!r.ok) return;
+    const alerts = await r.json();
+    const el = document.getElementById("alerts");
+    if(!alerts.length){ el.innerHTML=""; return; }
+    el.innerHTML = alerts.slice(0,20).map(a=>
+      '<div class="alert-item">'
+      + '<div class="a-head">🔔 '+fmtTime(a.ts)+' · '+esc(a.name||a.phone)+(a.ticket?' · '+esc(a.ticket):'')+'</div>'
+      + '<div class="a-msg">'+esc(a.message)+'</div>'
+      + (a.reason?'<div class="a-reason">'+esc(a.reason)+'</div>':'')
+      + '</div>').join("");
+  }catch(e){ /* silencioso */ }
 }
 
 function renderList(){

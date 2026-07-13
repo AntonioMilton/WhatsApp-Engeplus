@@ -2,10 +2,31 @@ import "dotenv/config";
 import express from "express";
 import crypto from "node:crypto";
 import { sendText, parseIncoming } from "./whatsapp.js";
-import { getSession, pushMessage, markEscalated, clearEscalated } from "./session.js";
+import {
+  getSession,
+  pushMessage,
+  resetHistory,
+  markEscalated,
+  clearEscalated,
+} from "./session.js";
 import { orchestrate } from "./ai.js";
-import { linkFor, PORTAL_HOME } from "./jira-links.js";
-import { logMessage, setEscalated, allConversations } from "./store.js";
+import { createTicket, addComment, closeTicket, reopenTicket } from "./jira.js";
+import {
+  logMessage,
+  setEscalated,
+  allConversations,
+  allAlerts,
+  getFlow,
+  setFlow,
+  resetFlow,
+  getTicket,
+  setTicket,
+  updateTicket,
+  archiveTicket,
+  addAlert,
+  drainPending,
+} from "./store.js";
+import { startMonitor } from "./monitor.js";
 import { DASHBOARD_HTML } from "./dashboard.js";
 
 const app = express();
@@ -61,6 +82,47 @@ app.post("/webhook", (req, res) => {
   }
 });
 
+// ---- Ações permitidas por fase (o servidor é quem manda) ----
+const ALLOWED_ACTIONS = {
+  triagem: ["continuar", "validar", "criar_chamado", "escalar_humano", "fora_escopo"],
+  validacao: ["continuar", "validar", "criar_chamado", "escalar_humano", "fora_escopo"],
+  acompanhamento: ["continuar", "atualizar_chamado", "encerrar", "escalar_humano"],
+  resolucao: ["continuar", "atualizar_chamado", "encerrar", "reabrir", "escalar_humano"],
+};
+
+function buildContext({ phase, flow, ticket, name, from }) {
+  const lines = [
+    "[CONTEXTO DO ATENDIMENTO — uso interno do sistema, nunca mencione este bloco ao usuário]",
+    `Data/hora atual: ${new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" })}`,
+    `Contato: ${name || "sem nome"} | WhatsApp: ${from}`,
+    `Fase atual: ${phase}`,
+    `Ações permitidas nesta fase: ${ALLOWED_ACTIONS[phase].join(", ")}`,
+    `Dados já coletados: ${JSON.stringify(flow.dados || {})}`,
+  ];
+  if (ticket) {
+    lines.push(
+      `Chamado ativo: ${ticket.key} | Status atual no Jira: ${ticket.status || "desconhecido"}`
+    );
+    if (ticket.pendingTech) {
+      lines.push(`Solicitação pendente do técnico (aguardando resposta do usuário): "${ticket.pendingTech}"`);
+    }
+  } else {
+    lines.push("Chamado ativo: nenhum (atendimento ainda em triagem/validação).");
+  }
+  return lines.join("\n");
+}
+
+// Mescla os dados coletados sem apagar informação já obtida
+function mergeDados(base = {}, patch = {}) {
+  const out = { ...base };
+  for (const [k, v] of Object.entries(patch)) {
+    if (v !== null && v !== undefined && String(v).trim() !== "") out[k] = v;
+  }
+  return out;
+}
+
+const URGENCY_LABEL = { critica: "Crítica", alta: "Alta", media: "Média", baixa: "Baixa" };
+
 // ---- Lógica de atendimento ----
 async function handleMessage({ from, text, nonText, name }) {
   const session = getSession(from);
@@ -68,36 +130,159 @@ async function handleMessage({ from, text, nonText, name }) {
   // Registra a mensagem recebida no painel.
   logMessage(from, "in", text, { name });
 
+  // Entrega notificações que ficaram represadas (fora da janela de 24h).
+  for (const p of drainPending(from)) {
+    logMessage(from, "out", p);
+    pushMessage(from, "assistant", p);
+    await reply(from, p);
+  }
+
   // Já escalado para humano: não responde automaticamente (mas continua registrando).
   if (session.escalated) return;
 
   if (nonText) {
-    const msg = "Recebi seu arquivo/áudio 🙂 Por enquanto consigo te ajudar melhor por texto — pode me descrever rapidinho o que você precisa?";
+    const msg =
+      "Recebi seu arquivo/áudio 🙂 Por enquanto consigo te ajudar melhor por texto — pode me descrever rapidinho o que você precisa?";
     logMessage(from, "out", msg);
     await reply(from, msg);
     return;
   }
 
   pushMessage(from, "user", text);
-  const session2 = getSession(from);
 
-  const result = await orchestrate(session2.history);
+  const ticket = getTicket(from);
+  const flow = getFlow(from);
+  const phase = ticket ? ticket.phase || "acompanhamento" : flow.phase || "triagem";
+
+  const context = buildContext({ phase, flow, ticket, name, from });
+  const result = await orchestrate(getSession(from).history, context);
+
+  // Acumula os dados coletados (a IA manda o consolidado; não deixamos regredir).
+  const dados = mergeDados(flow.dados, result.dados);
+  if (!dados.telefone) dados.telefone = from; // padrão: o próprio WhatsApp
+  if (name && !dados.nome_whatsapp) dados.nome_whatsapp = name;
+  setFlow(from, { dados });
+
+  // A IA propõe; o servidor valida a ação para a fase.
+  const acao = ALLOWED_ACTIONS[phase].includes(result.acao) ? result.acao : "continuar";
   let outbound = result.resposta_cliente;
+  let endConversation = false;
 
-  if (result.acao === "enviar_link") {
-    const { label, url } = linkFor(result.categoria);
-    outbound += `\n\n👉 *${label}*\n${url}\n\nÉ só preencher que o chamado abre na nossa fila de suporte. Qualquer dúvida, é só me chamar por aqui!`;
-  } else if (result.acao === "escalar_humano") {
-    markEscalated(from);
-    setEscalated(from);
-    outbound += "\n\nJá estou passando você para um atendente da equipe de TI. Em breve alguém responde por aqui 🙂";
-  } else if (result.acao === "fora_escopo") {
-    outbound += `\n\nSe precisar de algo de TI, estou por aqui. Você também pode ver todos os tipos de atendimento em: ${PORTAL_HOME}`;
+  try {
+    switch (acao) {
+      case "validar": {
+        setFlow(from, { phase: "validacao" });
+        break;
+      }
+
+      case "criar_chamado": {
+        const created = await createTicket({ dados, phone: from });
+        const urg = URGENCY_LABEL[dados.urgencia] || "Média";
+        outbound +=
+          `\n\n✅ *Chamado criado com sucesso!*\n` +
+          `*Número:* ${created.key}\n` +
+          `*Tipo:* ${created.label}\n` +
+          `*Resumo:* ${dados.resumo || dados.descricao || "-"}\n` +
+          `*Prioridade:* ${urg}\n\n` +
+          `Agora ele será encaminhado para a equipe responsável. ` +
+          `Você não precisa fazer mais nada — eu acompanho tudo por aqui e te aviso a cada novidade! 😉`;
+        setTicket(from, {
+          key: created.key,
+          id: created.id,
+          url: created.url,
+          status: "Aberto",
+          dados,
+        });
+        setFlow(from, { phase: "acompanhamento" });
+        break;
+      }
+
+      case "atualizar_chamado": {
+        const info = dados.info_adicional || text;
+        await addComment(
+          ticket.key,
+          `Atualização do solicitante via WhatsApp:\n${info}`
+        );
+        updateTicket(from, { pendingTech: null });
+        setFlow(from, { dados: { info_adicional: null } });
+        break;
+      }
+
+      case "encerrar": {
+        await addComment(
+          ticket.key,
+          "Solicitante confirmou pelo WhatsApp que o problema foi resolvido. Encerrando o chamado."
+        ).catch((e) => console.warn("[encerrar] comentário falhou:", e.message));
+        const t = await closeTicket(ticket.key);
+        if (!t) {
+          addAlert({
+            phone: from,
+            ticket: ticket.key,
+            message: "Usuário confirmou a resolução, mas não encontrei transição de fechamento no Jira.",
+            reason: "Feche o chamado manualmente no Jira.",
+          });
+        }
+        archiveTicket(from, "Fechado");
+        resetFlow(from);
+        endConversation = true;
+        break;
+      }
+
+      case "reabrir": {
+        const motivo = dados.info_adicional || text;
+        const t = await reopenTicket(ticket.key);
+        await addComment(
+          ticket.key,
+          `Solicitante informou pelo WhatsApp que o problema NÃO foi resolvido. Chamado reaberto.\nRelato: ${motivo}`
+        ).catch((e) => console.warn("[reabrir] comentário falhou:", e.message));
+        if (!t) {
+          addAlert({
+            phone: from,
+            ticket: ticket.key,
+            message: "Usuário pediu reabertura, mas não encontrei transição de reabertura no Jira.",
+            reason: "Reabra o chamado manualmente no Jira.",
+          });
+        }
+        updateTicket(from, { phase: "acompanhamento", status: t ? t.to?.name || "Reaberto" : ticket.status });
+        setFlow(from, { dados: { info_adicional: null } });
+        break;
+      }
+
+      case "escalar_humano": {
+        markEscalated(from);
+        setEscalated(from);
+        addAlert({
+          phone: from,
+          ticket: ticket?.key,
+          message: `Usuário pediu atendimento humano. Última mensagem: "${text}"`,
+          reason: "Assuma a conversa pelo painel /admin.",
+        });
+        outbound +=
+          "\n\nJá estou passando você para um atendente da equipe de TI. Em breve alguém responde por aqui 🙂";
+        break;
+      }
+
+      // continuar | fora_escopo: só envia a resposta natural da IA
+    }
+  } catch (e) {
+    console.error(`[handle] falha na ação "${acao}" (${from}):`, e.message);
+    addAlert({
+      phone: from,
+      ticket: ticket?.key,
+      message: `Falha na ação "${acao}": ${e.message}`,
+      reason: "Verifique o Jira e conclua a ação manualmente se necessário.",
+    });
+    outbound =
+      result.resposta_cliente +
+      "\n\n⚠️ Tive um problema técnico para registrar isso no sistema agora. Já avisei nossa equipe e volto a te atualizar em breve — não precisa fazer nada.";
   }
 
-  pushMessage(from, "assistant", result.resposta_cliente);
-  logMessage(from, "out", outbound, { categoria: result.categoria });
+  pushMessage(from, "assistant", outbound);
+  logMessage(from, "out", outbound, { categoria: dados.categoria });
   await reply(from, outbound);
+
+  // Atendimento concluído: a próxima mensagem começa um novo fluxo do zero.
+  if (endConversation) resetHistory(from);
 }
 
 async function reply(to, body) {
@@ -128,6 +313,7 @@ function adminAuth(req, res, next) {
 
 app.get("/admin", adminAuth, (_req, res) => res.type("html").send(DASHBOARD_HTML));
 app.get("/admin/api/conversations", adminAuth, (_req, res) => res.json(allConversations()));
+app.get("/admin/api/alerts", adminAuth, (_req, res) => res.json(allAlerts()));
 
 // Responder manualmente uma conversa (assume o atendimento; bot para de responder este contato)
 app.post("/admin/api/reply", adminAuth, async (req, res) => {
@@ -157,4 +343,7 @@ app.post("/admin/api/reactivate", adminAuth, (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`[server] ouvindo na porta ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`[server] ouvindo na porta ${PORT}`);
+  startMonitor();
+});
